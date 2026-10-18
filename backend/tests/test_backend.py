@@ -472,3 +472,194 @@ def test_api_triage_deliverable_partial_effort_increase():
     summary_container = r_container.json()["summary"]
     summary_build     = r_build.json()["summary"]
     assert summary_build["partial_support_count"] >= summary_container["partial_support_count"]
+
+
+# ---------------------------------------------------------------------------
+# Regression tests for review findings (offline, no network)
+# ---------------------------------------------------------------------------
+
+def test_clone_rejects_shell_injection_urls():
+    for bad in [
+        "https://example.com/a/b ; touch /tmp/pwned",
+        "https://example.com/a/b$(id)",
+        "https://example.com/a/b`id`",
+        "--upload-pack=evil",
+        "git@github.com:a/b.git",
+        "http://example.com/a/b",
+        "",
+    ]:
+        assert RepoScanner.shallow_clone_repo(bad) is None
+
+
+def test_next_fibonacci_never_returns_none():
+    from backend.agent import next_fibonacci_effort
+    assert next_fibonacci_effort(0) == 0
+    assert next_fibonacci_effort(5) == 8
+    assert next_fibonacci_effort(26) == 34
+    assert next_fibonacci_effort(10_000) == 610
+
+
+def test_round_half_up():
+    from backend.agent import round_half_up
+    assert round_half_up(4.5) == 5
+    assert round_half_up(9.5) == 10
+    assert round_half_up(2.4) == 2
+
+
+def test_pypi_probe_unresolvable_name_is_not_ready(monkeypatch):
+    import asyncio
+    import httpx
+    from backend import prober as prober_mod
+
+    class _Resp:
+        status_code = 404
+
+        def json(self):
+            return {}
+
+    class _Client:
+        def __init__(self, *a, **k):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def get(self, url):
+            return _Resp()
+
+    monkeypatch.setattr(prober_mod.httpx, "AsyncClient", _Client)
+    result = asyncio.run(MultiSourceProber()._probe_pypi("libcustom-dsp-engine", "1.2.0"))
+    assert result is None
+
+
+def test_blocker_effort_kept_alongside_unported_in_deep_mode():
+    payload = {
+        "raw_manifest": "- intel-mkl\n- rocksdb 8.6\n",
+        "manifest_type": "text",
+        "triage_depth": "deep",
+    }
+    resp = client.post("/api/triage", json=payload)
+    assert resp.status_code == 200
+    pkgs = {p["package_name"].lower(): p for p in resp.json()["packages"]}
+    blockers = [p for p in pkgs.values() if p["status"] == "blocker"]
+    for b in blockers:
+        assert b["total_effort_pd"] >= 10
+
+
+def test_csv_escapes_quotes():
+    from backend.agent import TriageAgent
+    pkg = PackageTriageResult(
+        package_name='we"ird',
+        status=AvailabilityStatus.NATIVE_AVAILABLE,
+        tier_description='tier "x"',
+    )
+    csv_text = TriageAgent()._generate_csv([pkg])
+    assert '"we""ird"' in csv_text
+    assert '"tier ""x"""' in csv_text
+
+
+def test_pdf_export_survives_markup_characters():
+    report = {
+        "project_name": "A & B <script>",
+        "summary": {"readiness_score_pct": 50, "recommendation": "Moderate Effort", "fibonacci_effort_pd": 8},
+        "packages": [{"package_name": "a<b&c", "ecosystem": "pypi", "status": "native_available"}],
+    }
+    resp = client.post("/api/export/pdf", json=report)
+    assert resp.status_code == 200
+    assert resp.content.startswith(b"%PDF")
+
+
+def test_oversized_manifest_rejected():
+    resp = client.post("/api/triage", json={"raw_manifest": "x" * 600_000})
+    assert resp.status_code == 413
+
+
+def test_stream_emits_error_event_on_failure(monkeypatch):
+    from backend import main as main_mod
+
+    async def boom(self, request):
+        raise RuntimeError("kaboom")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(main_mod.TriageAgent, "run_triage_stream", boom)
+    resp = client.post("/api/triage/stream", json={"raw_manifest": "redis"})
+    assert '"type": "error"' in resp.text
+
+
+def test_cors_not_wildcard_with_credentials():
+    resp = client.options(
+        "/api/health",
+        headers={"Origin": "https://evil.example", "Access-Control-Request-Method": "GET"},
+    )
+    assert resp.headers.get("access-control-allow-origin") != "*"
+    assert resp.headers.get("access-control-allow-credentials") != "true"
+
+
+def test_unknown_unported_package_gets_honest_low_confidence_estimate():
+    """No fabricated build deps / SIMD findings for packages with no curated metadata."""
+    pkg = PackageTriageResult(
+        package_name="libcustom-dsp-engine",
+        status=AvailabilityStatus.UNPORTED_BUILD_REQUIRED,
+        tier_description="Unverified",
+    )
+    BuildAnalyzer.analyze_package_build(pkg, "rhel9")
+    assert pkg.build_dependencies == []
+    assert pkg.test_dependencies == []
+    assert pkg.arch_sensitivity.has_simd_avx is False
+    assert pkg.arch_sensitivity.simd_instruction_count == 0
+    assert pkg.confidence_level == "Low"
+    assert pkg.total_effort_pd == 1
+    assert "NOT assessed" in pkg.porting_notes
+
+
+def test_curated_rocksdb_path_unchanged():
+    pkg = PackageTriageResult(
+        package_name="rocksdb",
+        status=AvailabilityStatus.UNPORTED_BUILD_REQUIRED,
+        tier_description="x",
+    )
+    BuildAnalyzer.analyze_package_build(pkg, "rhel9")
+    assert any(d.name.startswith("jemalloc") for d in pkg.build_dependencies)
+    assert pkg.total_effort_pd >= 4
+
+
+def _pkg(name, status, effort=0, **kw):
+    return PackageTriageResult(
+        package_name=name, status=status, tier_description="t", total_effort_pd=effort, **kw
+    )
+
+
+def test_summarize_tiers_and_fibonacci_ceiling():
+    from backend.agent import TriageAgent
+    from backend.models import SalesRecommendationTier as T
+
+    S = AvailabilityStatus
+    # Turnkey: everything native, zero effort
+    s = TriageAgent._summarize([_pkg("a", S.NATIVE_AVAILABLE), _pkg("b", S.PLATFORM_AGNOSTIC)], DeliverableType.CONTAINER)
+    assert s.recommendation == T.MINIMAL_EFFORT and s.fibonacci_effort_pd == 0
+
+    # (14 + 5) * 1.3 = 24.7 -> 25 -> next Fibonacci 34 -> Moderate
+    s = TriageAgent._summarize(
+        [_pkg("a", S.UNPORTED_BUILD_REQUIRED, 4), _pkg("b", S.UNPORTED_BUILD_REQUIRED, 10)], DeliverableType.BUILD
+    )
+    assert s.fibonacci_effort_pd == 34 and s.recommendation == T.MODERATE_EFFORT
+
+    # Blocker always forces the alternative-required tier
+    s = TriageAgent._summarize([_pkg("m", S.BLOCKER, 10), _pkg("n", S.NATIVE_AVAILABLE)], DeliverableType.BUILD)
+    assert s.recommendation == T.NOT_POSSIBLE_AS_IS and s.blocker_count == 1
+
+    # Large totals reach Significant
+    s = TriageAgent._summarize([_pkg("x", S.UNPORTED_BUILD_REQUIRED, 40)], DeliverableType.BUILD)
+    assert s.recommendation == T.SIGNIFICANT_EFFORT
+
+
+def test_stream_steps_have_sequential_ids_and_end_with_result():
+    import json as _json
+    resp = client.post("/api/triage/stream", json={"raw_manifest": "- intel-mkl\n- rocksdb 8.6\n", "manifest_type": "text"})
+    events = [_json.loads(l[6:]) for l in resp.text.split("\n\n") if l.startswith("data: ")]
+    steps = [e["step"]["step_id"] for e in events if e["type"] == "step"]
+    assert steps == list(range(1, len(steps) + 1))
+    assert events[-1]["type"] == "result"

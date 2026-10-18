@@ -1,5 +1,7 @@
 import json
 import logging
+import os
+from xml.sax.saxutils import escape as xml_escape
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, Response
@@ -16,14 +18,39 @@ app = FastAPI(
     version="1.0.0"
 )
 
-# Enable CORS for local Vite dev server
+# CORS: restricted to known dev/UI origins by default (override with CORS_ORIGINS, comma-separated).
+# The API uses no cookies, so credentials are not enabled.
+_cors_origins = [
+    o.strip() for o in os.getenv(
+        "CORS_ORIGINS",
+        "http://localhost:5173,http://127.0.0.1:5173,http://localhost,http://127.0.0.1",
+    ).split(",") if o.strip()
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
+    allow_origins=_cors_origins,
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
+
+MAX_MANIFEST_CHARS = 500_000
+
+
+def _escape_markup(value):
+    """Recursively XML-escape strings so user/LLM text cannot inject ReportLab paragraph markup."""
+    if isinstance(value, str):
+        return xml_escape(value, {"'": "&apos;", '"': "&quot;"})
+    if isinstance(value, list):
+        return [_escape_markup(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _escape_markup(v) for k, v in value.items()}
+    return value
+
+
+def _validate_request_size(request: TriageRequest) -> None:
+    if request.raw_manifest and len(request.raw_manifest) > MAX_MANIFEST_CHARS:
+        raise HTTPException(status_code=413, detail=f"Manifest exceeds {MAX_MANIFEST_CHARS} characters")
 
 
 @app.get("/api/health")
@@ -107,6 +134,7 @@ libcustom-dsp-engine==1.2.0
 
 @app.post("/api/triage", response_model=TriageResponse)
 async def triage_workload(request: TriageRequest):
+    _validate_request_size(request)
     agent = TriageAgent(api_key=request.gemini_api_key)
     final_data = None
     async for event in agent.run_triage_stream(request):
@@ -123,11 +151,16 @@ async def triage_workload(request: TriageRequest):
 @app.post("/api/triage/stream")
 async def triage_workload_stream(request: TriageRequest):
     """Server-Sent Events (SSE) streaming endpoint returning real-time agent thoughts, tool calls, and final report."""
+    _validate_request_size(request)
     agent = TriageAgent(api_key=request.gemini_api_key)
 
     async def event_generator():
-        async for event in agent.run_triage_stream(request):
-            yield f"data: {json.dumps(event)}\n\n"
+        try:
+            async for event in agent.run_triage_stream(request):
+                yield f"data: {json.dumps(event)}\n\n"
+        except Exception as e:
+            logger.error(f"Triage stream failed: {e}", exc_info=True)
+            yield f"data: {json.dumps({'type': 'error', 'message': 'Triage failed: ' + str(e)})}\n\n"
 
     return StreamingResponse(
         event_generator(),
@@ -140,7 +173,7 @@ async def triage_workload_stream(request: TriageRequest):
 async def export_executive_pdf(report_data: dict):
     """Generates an executive-ready, polished PDF qualification memo from triage results."""
     try:
-        pdf_bytes = ExecutivePDFGenerator.generate(report_data)
+        pdf_bytes = ExecutivePDFGenerator.generate(_escape_markup(report_data))
         target_name = report_data.get("primary_package_name") or report_data.get("project_name", "Migration_Triage")
         safe_name = "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in target_name)
         return Response(

@@ -1,8 +1,11 @@
 import os
 import re
+import json
+import math
 import asyncio
+import datetime
 import logging
-from typing import List, Dict, Any, AsyncGenerator, Optional
+from typing import List, Dict, Any, AsyncGenerator, Optional, Tuple
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -23,6 +26,7 @@ from .models import (
     ArchSupportScan,
     DockerfileImageFinding,
     ConfigImageFinding,
+    _PARTIAL_EFFORT_MULTIPLIERS,
 )
 from .normalizer import UniversalNormalizer
 from .prober import MultiSourceProber
@@ -32,6 +36,16 @@ from .gemini_helper import generate_gemini_content
 from .url_extractor import URLExtractor
 
 logger = logging.getLogger("agent")
+
+BUFFER_PERSON_DAYS = 5          # one person-week of contingency added to the itemised total
+EFFORT_CEILING_FACTOR = 1.30    # multiplier applied before rounding up to the next Fibonacci number
+
+_SIMD_COMPLEXITY_BY_NAME = {
+    "direct": SIMDPortingComplexity.DIRECT,
+    "simde_compatible": SIMDPortingComplexity.SIMDE_COMPATIBLE,
+    "partial_rewrite": SIMDPortingComplexity.PARTIAL_REWRITE,
+    "full_redesign": SIMDPortingComplexity.FULL_REDESIGN,
+}
 
 FIBONACCI_NUMBERS = [0, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144, 233, 377, 610]
 
@@ -45,6 +59,14 @@ def next_fibonacci_effort(effort: float) -> int:
     for fib in FIBONACCI_NUMBERS:
         if fib > effort:
             return fib
+    return FIBONACCI_NUMBERS[-1]
+
+
+def round_half_up(value: float) -> int:
+    """Round .5 up (Python's round() is banker's rounding: 4.5 -> 4)."""
+    return int(math.floor(value + 0.5))
+
+
 KNOWN_ECOSYSTEM_DETAILS: Dict[str, Dict[str, str]] = {
     "rocksdb": {
         "git_repo_url": "https://github.com/facebook/rocksdb",
@@ -124,536 +146,259 @@ class TriageAgent:
 
         self.prober = MultiSourceProber(gemini_client=self.gemini_client)
 
-    async def run_triage_stream(self, request: TriageRequest) -> AsyncGenerator[Dict[str, Any], None]:
-        """Runs the triage pipeline yielding live agent steps and the final comprehensive response."""
-        # Update gemini client if request includes an override key
-        if request.gemini_api_key and not self.gemini_client:
-            try:
-                from google import genai
-                self.gemini_client = genai.Client(api_key=request.gemini_api_key.strip())
-                self.prober.set_gemini_client(self.gemini_client)
-            except Exception as e:
-                logger.warning(f"Could not initialize requested Gemini client: {e}")
+    # ------------------------------------------------------------------
+    # Pipeline helpers (pure / synchronous unless noted)
+    # ------------------------------------------------------------------
 
-        steps: List[AgentStep] = []
-        step_counter = 1
+    class _Steps:
+        """Builds SSE step events with an auto-incrementing step id."""
 
-        # Resolve effective OS and platform from combined environment field
-        effective_os = request.effective_os()
-        deliverable_type: DeliverableType = request.deliverable_type
+        def __init__(self) -> None:
+            self.counter = 1
 
-        # Step 1: Ingestion & Normalization
-        yield {
-            "type": "step",
-            "step": AgentStep(
-                step_id=step_counter,
-                agent_name="IngestionAgent",
-                action_type="plan",
-                target="Input Manifests",
-                thought="Ingesting provided input and standardizing packages into canonical Package URLs (PURL).",
-                detail=(
-                    f"Target: {request.target_environment.display} (ppc64le). "
-                    f"Deliverable: {deliverable_type.value.replace('_', ' ').title()}. "
-                    f"Depth: {request.triage_depth.value}."
-                )
-            ).model_dump()
-        }
-        await asyncio.sleep(0.3)
-        step_counter += 1
-
-        raw_text = request.raw_manifest or ""
-
-        parsed_items = UniversalNormalizer.normalize(raw_text, request.manifest_type or "auto")
-
-        # Provenance detection & URL extraction
-        detected_git_url: Optional[str] = request.git_repo_url
-        detected_doc_url: Optional[str] = request.doc_url
-        primary_pkg_name: Optional[str] = None
-        primary_version: Optional[str] = None
-        primary_ecosystem: Optional[str] = None
-
-        # Check raw text for embedded URLs if not already supplied
-        if raw_text:
-            github_matches = re.findall(r"https?://github\.com/[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+", raw_text)
-            if not detected_git_url and github_matches:
-                detected_git_url = github_matches[0]
-            
-            all_urls = re.findall(r"https?://[a-zA-Z0-9_.-]+\.[a-zA-Z]{2,}(?:/[^\s)\"'>]*)?", raw_text)
-            non_git = [u for u in all_urls if "github.com" not in u]
-            if not detected_doc_url and non_git:
-                detected_doc_url = non_git[0]
-
-        # Step 1.1: If user supplied a GitHub or documentation URL, infer dependencies via LLM/scraper
-        candidate_url = detected_git_url or detected_doc_url
-        if not candidate_url and raw_text and URLExtractor.is_url(raw_text):
-            candidate_url = raw_text.strip()
-            if "github.com" in candidate_url:
-                detected_git_url = candidate_url
-            else:
-                detected_doc_url = candidate_url
-
-        if candidate_url and URLExtractor.is_url(candidate_url):
-            yield {
+        def emit(self, agent_name: str, action_type: str, target: str, thought: str,
+                 detail: Optional[str] = None) -> Dict[str, Any]:
+            event = {
                 "type": "step",
                 "step": AgentStep(
-                    step_id=step_counter,
-                    agent_name="URLScraperAgent",
-                    action_type="url_inference",
-                    target=candidate_url,
-                    thought=f"Crawling package website or repository ({candidate_url}) to extract dependencies and manifest declarations...",
-                ).model_dump()
+                    step_id=self.counter,
+                    agent_name=agent_name,
+                    action_type=action_type,
+                    target=target,
+                    thought=thought,
+                    detail=detail,
+                ).model_dump(),
             }
-            await asyncio.sleep(0.3)
-            step_counter += 1
+            self.counter += 1
+            return event
 
-            url_pkgs, url_title, url_note = await URLExtractor.extract_from_url(candidate_url, gemini_client=self.gemini_client)
-            if url_pkgs:
-                parsed_items.extend(url_pkgs)
-                primary_pkg_name = url_pkgs[0]["name"]
-                primary_version = url_pkgs[0].get("version", "latest")
-                primary_ecosystem = url_pkgs[0].get("ecosystem", "native_c")
-                yield {
-                    "type": "step",
-                    "step": AgentStep(
-                        step_id=step_counter,
-                        agent_name="LLMDependencyInferenceAgent",
-                        action_type="url_inference",
-                        target=url_title,
-                        thought=f"Inferred {len(url_pkgs)} library requirements and version specifications from {candidate_url}.",
-                        detail=", ".join([f"{p['name']} ({p.get('version', 'latest')})" for p in url_pkgs[:6]]) + ("..." if len(url_pkgs) > 6 else "")
-                    ).model_dump()
-                }
-                await asyncio.sleep(0.3)
-                step_counter += 1
-        
-        # If user explicitly passed a list of packages
-        if request.packages_list:
-            for p in request.packages_list:
-                parsed_items.append({
-                    "name": p.get("name", ""),
-                    "version": p.get("version", "latest"),
-                    "ecosystem": p.get("ecosystem", "container")
-                })
+    @staticmethod
+    def _component_effort(p: PackageTriageResult) -> float:
+        """Sum of the itemised effort components for one package (person-days, unrounded)."""
+        return (
+            p.base_build_effort_pd
+            + p.transitive_deps_effort_pd
+            + p.arch_complexity_effort_pd
+            + p.test_effort_pd
+        )
 
-        # Remove duplicates
-        unique_items = []
+    @staticmethod
+    def _detect_urls(request: TriageRequest, raw_text: str) -> Tuple[Optional[str], Optional[str]]:
+        """Returns (git_url, doc_url) from the request, falling back to URLs embedded in raw text."""
+        git_url: Optional[str] = request.git_repo_url
+        doc_url: Optional[str] = request.doc_url
+        if raw_text:
+            github_matches = re.findall(r"https?://github\.com/[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+", raw_text)
+            if not git_url and github_matches:
+                git_url = github_matches[0]
+            all_urls = re.findall(r"https?://[a-zA-Z0-9_.-]+\.[a-zA-Z]{2,}(?:/[^\s)\"'>]*)?", raw_text)
+            non_git = [u for u in all_urls if "github.com" not in u]
+            if not doc_url and non_git:
+                doc_url = non_git[0]
+        return git_url, doc_url
+
+    @staticmethod
+    def _dedupe_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        unique: List[Dict[str, Any]] = []
         seen = set()
-        for item in parsed_items:
+        for item in items:
             key = (item["name"].lower(), item.get("version", "latest"))
             if key not in seen and item["name"].strip():
                 seen.add(key)
-                unique_items.append(item)
+                unique.append(item)
+        return unique
 
-        # Infer primary package name if not set yet
-        if not primary_pkg_name:
-            if detected_git_url:
-                gh_m = re.search(r"github\.com/[^/]+/([^/\s?#]+)", detected_git_url)
+    @staticmethod
+    def _infer_primary(
+        unique_items: List[Dict[str, Any]],
+        git_url: Optional[str],
+        doc_url: Optional[str],
+        name: Optional[str],
+        version: Optional[str],
+        ecosystem: Optional[str],
+    ) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[str]]:
+        """Infers the primary package and enriches provenance from the known-ecosystem table.
+
+        Returns (name, version, ecosystem, git_url, doc_url).
+        """
+        if not name:
+            if git_url:
+                gh_m = re.search(r"github\.com/[^/]+/([^/\s?#]+)", git_url)
                 if gh_m:
-                    primary_pkg_name = gh_m.group(1).replace(".git", "").lower()
-            elif detected_doc_url:
-                doc_m = re.search(r"https?://(?:www\.)?([^/\.]+)", detected_doc_url)
+                    name = gh_m.group(1).replace(".git", "").lower()
+            elif doc_url:
+                doc_m = re.search(r"https?://(?:www\.)?([^/\.]+)", doc_url)
                 if doc_m:
-                    primary_pkg_name = doc_m.group(1).lower()
+                    name = doc_m.group(1).lower()
             elif unique_items:
-                primary_pkg_name = unique_items[0]["name"]
-                primary_version = unique_items[0].get("version", "latest")
-                primary_ecosystem = unique_items[0].get("ecosystem", "container")
+                name = unique_items[0]["name"]
+                version = unique_items[0].get("version", "latest")
+                ecosystem = unique_items[0].get("ecosystem", "container")
 
-        # Enrich provenance details from known ecosystem table
-        if primary_pkg_name:
-            norm_k = primary_pkg_name.lower().strip()
-            if norm_k in KNOWN_ECOSYSTEM_DETAILS:
-                k_info = KNOWN_ECOSYSTEM_DETAILS[norm_k]
-                if not detected_git_url:
-                    detected_git_url = k_info.get("git_repo_url")
-                if not detected_doc_url:
-                    detected_doc_url = k_info.get("doc_url")
-                if not primary_version or primary_version == "latest":
-                    primary_version = k_info.get("version", "latest")
-                if not primary_ecosystem:
-                    primary_ecosystem = k_info.get("ecosystem", "native_c")
+        if name:
+            info = KNOWN_ECOSYSTEM_DETAILS.get(name.lower().strip())
+            if info:
+                git_url = git_url or info.get("git_repo_url")
+                doc_url = doc_url or info.get("doc_url")
+                if not version or version == "latest":
+                    version = info.get("version", "latest")
+                if not ecosystem:
+                    ecosystem = info.get("ecosystem", "native_c")
+        return name, version, ecosystem, git_url, doc_url
 
-        yield {
-            "type": "step",
-            "step": AgentStep(
-                step_id=step_counter,
-                agent_name="IngestionAgent",
-                action_type="plan",
-                target="Dependency Normalizer",
-                thought=f"Successfully extracted and normalized {len(unique_items)} unique components across container, language, and system layers." + (f" Primary package: {primary_pkg_name}." if primary_pkg_name else ""),
-                detail=", ".join([i["name"] for i in unique_items[:6]]) + ("..." if len(unique_items) > 6 else "")
-            ).model_dump()
-        }
-        await asyncio.sleep(0.3)
-        step_counter += 1
-
-        # Step 1.5: Repository Architecture & Container Scan (Sub-Tasks 5, 6, 7)
-        arch_scan: Optional[ArchSupportScan] = None
-        docker_findings: List[DockerfileImageFinding] = []
-        config_findings: List[ConfigImageFinding] = []
-
-        scan_repo_url = detected_git_url or request.git_repo_url
-        if scan_repo_url:
-            yield {
-                "type": "step",
-                "step": AgentStep(
-                    step_id=step_counter,
-                    agent_name="RepoScanAgent",
-                    action_type="scan",
-                    target=scan_repo_url,
-                    thought="Cloning repository shallowly to inspect architecture markers, Dockerfiles, and CI configurations...",
-                ).model_dump()
-            }
-            await asyncio.sleep(0.2)
-            step_counter += 1
-
-            temp_repo = RepoScanner.shallow_clone_repo(scan_repo_url)
-            if temp_repo:
-                arch_scan = RepoScanner.scan_arch_support(temp_repo)
-                docker_findings = RepoScanner.scan_dockerfiles(temp_repo)
-                config_findings = RepoScanner.scan_config_images(temp_repo)
-                RepoScanner.cleanup_repo(temp_repo)
-
-        if not arch_scan:
-            target_pkg_name = request.project_name or (unique_items[0]["name"] if unique_items else "workload")
-            arch_scan = RepoScanner.llm_infer_arch_support(target_pkg_name, gemini_client=self.gemini_client)
-
-        # Step 2: Multi-Source Availability Probing (Sub-Task 1 Version-Aware)
-        triaged_packages: List[PackageTriageResult] = []
-        unported_candidates = []
-
-        for item in unique_items:
-            name = item["name"]
-            version = item.get("version", "latest")
-            eco = item.get("ecosystem", "container")
-
-            yield {
-                "type": "step",
-                "step": AgentStep(
-                    step_id=step_counter,
-                    agent_name="AvailabilityProber",
-                    action_type="lookup",
-                    target=f"{name} ({eco})",
-                    thought=f"Consulting live registries (Quay.io/Docker Hub), {effective_os} repos, and Gemini LLM for {name} ({version}) on ppc64le...",
-                ).model_dump()
-            }
-            await asyncio.sleep(0.15)
-            step_counter += 1
-
-            probe_res = await self.prober.probe_component(
-                name, version, eco, effective_os, deliverable_type
+    @staticmethod
+    def _clone_and_scan(url: str) -> Tuple[Optional[ArchSupportScan], List[DockerfileImageFinding], List[ConfigImageFinding]]:
+        """Blocking: shallow-clone a repo and scan it. Run via asyncio.to_thread."""
+        temp_repo = RepoScanner.shallow_clone_repo(url)
+        if not temp_repo:
+            return None, [], []
+        try:
+            return (
+                RepoScanner.scan_arch_support(temp_repo),
+                RepoScanner.scan_dockerfiles(temp_repo),
+                RepoScanner.scan_config_images(temp_repo),
             )
+        finally:
+            RepoScanner.cleanup_repo(temp_repo)
 
-            pkg_result = PackageTriageResult(
-                package_name=name,
-                requested_version=version,
-                ecosystem=eco,
-                status=probe_res["status"],
-                tier_description=probe_res["tier"],
-                evidence_source=probe_res.get("evidence"),
-                evidence_url=probe_res.get("url"),
-                substitute_package=probe_res.get("substitute"),
-                version_warning=probe_res.get("version_warning"),
-                deliverable_match=probe_res.get("deliverable_match", DeliverableMatchStatus.SUPPORTED),
-                deliverable_detail=probe_res.get("deliverable_detail"),
+    async def _probe_image_findings(
+        self,
+        docker_findings: List[DockerfileImageFinding],
+        config_findings: List[ConfigImageFinding],
+        effective_os: str,
+        deliverable_type: DeliverableType,
+    ) -> None:
+        """Probes Dockerfile base images and compose/CI config images in place."""
+        for df in docker_findings:
+            probe = await self.prober.probe_component(df.base_image, df.tag, "container", effective_os, deliverable_type)
+            df.status = probe["status"]
+            if df.status in (AvailabilityStatus.UNPORTED_BUILD_REQUIRED, AvailabilityStatus.BLOCKER):
+                df.effort_pd = 0.5
+                df.notes = f"Base image {df.base_image}:{df.tag} not verified for ppc64le; container rebuild required."
+            else:
+                df.notes = f"Verified multi-arch ppc64le container ({probe.get('tier')})"
+
+        for cf in config_findings:
+            ref = cf.image_ref
+            img_name, img_tag = ref.rsplit(":", 1) if ":" in ref else (ref, "latest")
+            probe = await self.prober.probe_component(img_name, img_tag, "container", effective_os, deliverable_type)
+            cf.status = probe["status"]
+            if cf.status in (AvailabilityStatus.UNPORTED_BUILD_REQUIRED, AvailabilityStatus.BLOCKER):
+                cf.effort_pd = 0.5
+                cf.notes = f"Config image {ref} not verified for ppc64le; container rebuild required."
+            else:
+                cf.notes = f"Verified multi-arch ppc64le container ({probe.get('tier')})"
+
+    async def _refine_arch_with_llm(self, pkg: PackageTriageResult) -> None:
+        """Asks Gemini to size SIMD volume/complexity for a package and rescales its arch effort."""
+        if not self.gemini_client or not pkg.arch_sensitivity:
+            return
+        arch = pkg.arch_sensitivity
+        prompt = (
+            f"You are an IBM Power (ppc64le) porting specialist. Analyze this unported library '{pkg.package_name}'.\n"
+            f"Architecture issue: SIMD={arch.has_simd_avx}, 64KB Page={arch.has_64k_page_risk}, Asm={arch.has_inline_asm}.\n"
+            f"Code snippet:\n{arch.code_snippet}\n"
+            "Evaluate:\n"
+            "1. simd_instruction_count: estimated count of x86 SIMD/AVX instructions (e.g. 0, 45, 150, 320, 600)\n"
+            "2. simd_porting_complexity: one of 'direct' (macro drop-in), 'simde_compatible' (SIMDe header mapping), 'partial_rewrite' (mixed intrinsics requiring VSX rewrite), or 'full_redesign' (deep AVX-512 dependencies)\n"
+            "3. remediation_strategy: concise 2-sentence porting remediation vector recommending SIMDe, Power VSX intrinsics, or 64KB page allocator configuration.\n"
+            "Return ONLY JSON:\n"
+            "{\n"
+            '  "simd_instruction_count": int,\n'
+            '  "simd_porting_complexity": "direct" | "simde_compatible" | "partial_rewrite" | "full_redesign",\n'
+            '  "remediation_strategy": "string"\n'
+            "}\n"
+            "JSON:"
+        )
+        try:
+            resp_text = await asyncio.to_thread(generate_gemini_content, self.gemini_client, prompt, json_mode=True)
+            if not resp_text:
+                return
+            parsed = json.loads(resp_text.replace("```json", "").replace("```", "").strip())
+            if "simd_instruction_count" in parsed:
+                arch.simd_instruction_count = max(0, int(parsed["simd_instruction_count"]))
+            complexity = _SIMD_COMPLEXITY_BY_NAME.get(str(parsed.get("simd_porting_complexity", "")).lower())
+            if complexity:
+                arch.simd_porting_complexity = complexity
+            if "remediation_strategy" in parsed:
+                arch.remediation_strategy = parsed["remediation_strategy"]
+
+            base_arch = (
+                pkg.base_arch_complexity_effort_pd
+                if pkg.base_arch_complexity_effort_pd > 0
+                else (arch.base_engineering_effort_pd if arch.base_engineering_effort_pd > 0 else 2.0)
             )
+            count_m, comp_m = get_simd_multipliers(arch.simd_instruction_count, arch.simd_porting_complexity)
+            arch.base_engineering_effort_pd = base_arch
+            arch.simd_instruction_multiplier = count_m
+            arch.simd_complexity_multiplier = comp_m
+            pkg.arch_complexity_effort_pd = scale_arch_effort(
+                base_arch, arch.simd_instruction_count, arch.simd_porting_complexity
+            )
+            pkg.total_effort_pd = round_half_up(self._component_effort(pkg))
+        except Exception as llm_err:
+            logger.warning(f"Gemini code analysis call skipped: {llm_err}")
 
-            # Log version warning or deliverable match detail
-            if pkg_result.version_warning:
-                yield {
-                    "type": "step",
-                    "step": AgentStep(
-                        step_id=step_counter,
-                        agent_name="AvailabilityProber",
-                        action_type="lookup",
-                        target=f"{name} Version Notice",
-                        thought=f"⚠️ {pkg_result.version_warning}",
-                        detail=f"Requested: {version} | Verified Available on Power: {probe_res.get('available_version', 'N/A')}"
-                    ).model_dump()
-                }
-                await asyncio.sleep(0.1)
-                step_counter += 1
-
-            if pkg_result.deliverable_detail and pkg_result.deliverable_match != DeliverableMatchStatus.SUPPORTED:
-                yield {
-                    "type": "step",
-                    "step": AgentStep(
-                        step_id=step_counter,
-                        agent_name="DeliverableClassifier",
-                        action_type="lookup",
-                        target=f"{name} Deliverable Match",
-                        thought=f"Deliverable match [{deliverable_type.value}]: {pkg_result.deliverable_match.value.replace('_', ' ').title()}",
-                        detail=pkg_result.deliverable_detail
-                    ).model_dump()
-                }
-                await asyncio.sleep(0.1)
-                step_counter += 1
-            elif probe_res.get("evidence"):
-                yield {
-                    "type": "step",
-                    "step": AgentStep(
-                        step_id=step_counter,
-                        agent_name="AvailabilityProber",
-                        action_type="lookup",
-                        target=f"{name} Verified",
-                        thought=f"Qualification Result: {pkg_result.status.value.upper()} • {pkg_result.tier_description}",
-                        detail=probe_res.get("evidence")
-                    ).model_dump()
-                }
-                await asyncio.sleep(0.1)
-                step_counter += 1
-
-            if pkg_result.status == AvailabilityStatus.UNPORTED_BUILD_REQUIRED:
-                unported_candidates.append(pkg_result)
-
-            triaged_packages.append(pkg_result)
-
-        # Probe discovered Dockerfile base images & config images
-        if docker_findings:
-            for df in docker_findings:
-                img_probe = await self.prober.probe_component(
-                    df.base_image, df.tag, "container", effective_os, deliverable_type
-                )
-                df.status = img_probe["status"]
-                if df.status in [AvailabilityStatus.UNPORTED_BUILD_REQUIRED, AvailabilityStatus.BLOCKER]:
-                    df.effort_pd = 0.5
-                    df.notes = f"Base image {df.base_image}:{df.tag} not verified for ppc64le; container rebuild required."
-                else:
-                    df.notes = f"Verified multi-arch ppc64le container ({img_probe.get('tier')})"
-
-        if config_findings:
-            for cf in config_findings:
-                ref = cf.image_ref
-                img_tag = "latest"
-                if ":" in ref:
-                    img_name, img_tag = ref.rsplit(":", 1)
-                else:
-                    img_name = ref
-                cfg_probe = await self.prober.probe_component(img_name, img_tag, "container", effective_os, deliverable_type)
-                cf.status = cfg_probe["status"]
-                if cf.status in [AvailabilityStatus.UNPORTED_BUILD_REQUIRED, AvailabilityStatus.BLOCKER]:
-                    cf.effort_pd = 0.5
-                    cf.notes = f"Config image {ref} not verified for ppc64le; container rebuild required."
-                else:
-                    cf.notes = f"Verified multi-arch ppc64le container ({cfg_probe.get('tier')})"
-
-        # Attach findings to first package or primary package
-        if triaged_packages:
-            triaged_packages[0].arch_support_scan = arch_scan
-            triaged_packages[0].dockerfile_image_findings = docker_findings
-            triaged_packages[0].config_image_findings = config_findings
-
-        # Step 3: Deep Source Build & Transitive Dependency Scoping (Sub-Tasks 2, 3, 4)
-        if unported_candidates and request.triage_depth == "deep":
-            yield {
-                "type": "step",
-                "step": AgentStep(
-                    step_id=step_counter,
-                    agent_name="BuildScopingAgent",
-                    action_type="deep_scan",
-                    target="Unported Components",
-                    thought=f"Detected {len(unported_candidates)} unported components. Initiating deep source build audit, inspecting build-time dependencies, SIMD instructions, and test harnesses...",
-                ).model_dump()
-            }
-            await asyncio.sleep(0.3)
-            step_counter += 1
-
-            for pkg in unported_candidates:
-                yield {
-                    "type": "step",
-                    "step": AgentStep(
-                        step_id=step_counter,
-                        agent_name="BuildScopingAgent",
-                        action_type="deep_scan",
-                        target=pkg.package_name,
-                        thought=f"Parsing build configuration for {pkg.package_name}. Auditing BuildRequires, SIMD instructions, and test dependencies...",
-                    ).model_dump()
-                }
-                await asyncio.sleep(0.25)
-                step_counter += 1
-
-                # Apply build analyzer
-                BuildAnalyzer.analyze_package_build(pkg, request.target_os.value)
-
-                # Report discovered transitive dependencies
-                unported_sub_deps = [d for d in pkg.build_dependencies if d.status == AvailabilityStatus.UNPORTED_BUILD_REQUIRED]
-                if unported_sub_deps:
-                    yield {
-                        "type": "step",
-                        "step": AgentStep(
-                            step_id=step_counter,
-                            agent_name="BuildScopingAgent",
-                            action_type="deep_scan",
-                            target=f"{pkg.package_name} Build-Tree",
-                            thought=f"⚠️ Uncovered transitive dependency iceberg in {pkg.package_name}: {len(unported_sub_deps)} build requirement(s) also unported on ppc64le!",
-                            detail=", ".join([f"{d.name} (+{d.porting_effort_pd} PD)" for d in unported_sub_deps])
-                        ).model_dump()
-                    }
-                    await asyncio.sleep(0.2)
-                    step_counter += 1
-
-                # Report test dependencies (Sub-Task 4)
-                if pkg.test_dependencies:
-                    unported_tests = [t for t in pkg.test_dependencies if t.status != AvailabilityStatus.NATIVE_AVAILABLE]
-                    yield {
-                        "type": "step",
-                        "step": AgentStep(
-                            step_id=step_counter,
-                            agent_name="BuildScopingAgent",
-                            action_type="deep_scan",
-                            target=f"{pkg.package_name} Test Validation",
-                            thought=f"Scoped {len(pkg.test_dependencies)} test dependency/harness requirement(s). Test effort: {pkg.test_effort_pd} PD.",
-                            detail=", ".join([f"{t.name} ({t.status.value})" for t in pkg.test_dependencies])
-                        ).model_dump()
-                    }
-                    await asyncio.sleep(0.15)
-                    step_counter += 1
-
-                # Sub-Task 2 & 3: SIMD instruction count & 4-tier complexity analysis via Gemini
-                if pkg.arch_sensitivity and (pkg.arch_sensitivity.has_simd_avx or pkg.arch_sensitivity.has_64k_page_risk or pkg.arch_sensitivity.has_inline_asm):
-                    if self.gemini_client:
-                        try:
-                            prompt = (
-                                f"You are an IBM Power (ppc64le) porting specialist. Analyze this unported library '{pkg.package_name}'.\n"
-                                f"Architecture issue: SIMD={pkg.arch_sensitivity.has_simd_avx}, 64KB Page={pkg.arch_sensitivity.has_64k_page_risk}, Asm={pkg.arch_sensitivity.has_inline_asm}.\n"
-                                f"Code snippet:\n{pkg.arch_sensitivity.code_snippet}\n"
-                                "Evaluate:\n"
-                                "1. simd_instruction_count: estimated count of x86 SIMD/AVX instructions (e.g. 0, 45, 150, 320, 600)\n"
-                                "2. simd_porting_complexity: one of 'direct' (macro drop-in), 'simde_compatible' (SIMDe header mapping), 'partial_rewrite' (mixed intrinsics requiring VSX rewrite), or 'full_redesign' (deep AVX-512 dependencies)\n"
-                                "3. remediation_strategy: concise 2-sentence porting remediation vector recommending SIMDe, Power VSX intrinsics, or 64KB page allocator configuration.\n"
-                                "Return ONLY JSON:\n"
-                                "{\n"
-                                '  "simd_instruction_count": int,\n'
-                                '  "simd_porting_complexity": "direct" | "simde_compatible" | "partial_rewrite" | "full_redesign",\n'
-                                '  "remediation_strategy": "string"\n'
-                                "}\n"
-                                "JSON:"
-                            )
-                            resp_text = generate_gemini_content(self.gemini_client, prompt, json_mode=True)
-                            if resp_text:
-                                import json
-                                parsed_simd = json.loads(resp_text.replace("```json", "").replace("```", "").strip())
-                                if "simd_instruction_count" in parsed_simd:
-                                    pkg.arch_sensitivity.simd_instruction_count = int(parsed_simd["simd_instruction_count"])
-                                if "simd_porting_complexity" in parsed_simd:
-                                    c_map = {
-                                        "direct": SIMDPortingComplexity.DIRECT,
-                                        "simde_compatible": SIMDPortingComplexity.SIMDE_COMPATIBLE,
-                                        "partial_rewrite": SIMDPortingComplexity.PARTIAL_REWRITE,
-                                        "full_redesign": SIMDPortingComplexity.FULL_REDESIGN,
-                                    }
-                                    c_str = str(parsed_simd["simd_porting_complexity"]).lower()
-                                    if c_str in c_map:
-                                        pkg.arch_sensitivity.simd_porting_complexity = c_map[c_str]
-                                if "remediation_strategy" in parsed_simd:
-                                    pkg.arch_sensitivity.remediation_strategy = parsed_simd["remediation_strategy"]
-
-                                # Rescale arch effort from unscaled base_arch_complexity_effort_pd
-                                base_arch = (
-                                    pkg.base_arch_complexity_effort_pd
-                                    if pkg.base_arch_complexity_effort_pd > 0
-                                    else (pkg.arch_sensitivity.base_engineering_effort_pd if pkg.arch_sensitivity and pkg.arch_sensitivity.base_engineering_effort_pd > 0 else 2.0)
-                                )
-                                count_m, comp_m = get_simd_multipliers(
-                                    pkg.arch_sensitivity.simd_instruction_count,
-                                    pkg.arch_sensitivity.simd_porting_complexity
-                                )
-                                pkg.arch_sensitivity.base_engineering_effort_pd = base_arch
-                                pkg.arch_sensitivity.simd_instruction_multiplier = count_m
-                                pkg.arch_sensitivity.simd_complexity_multiplier = comp_m
-                                pkg.arch_complexity_effort_pd = scale_arch_effort(
-                                    base_arch,
-                                    pkg.arch_sensitivity.simd_instruction_count,
-                                    pkg.arch_sensitivity.simd_porting_complexity
-                                )
-                                total = (
-                                    pkg.base_build_effort_pd
-                                    + pkg.transitive_deps_effort_pd
-                                    + pkg.arch_complexity_effort_pd
-                                    + pkg.test_effort_pd
-                                )
-                                pkg.total_effort_pd = int(round(total))
-                        except Exception as llm_err:
-                            logger.warning(f"Gemini code analysis call skipped: {llm_err}")
-
-                    yield {
-                        "type": "step",
-                        "step": AgentStep(
-                            step_id=step_counter,
-                            agent_name="ArchitectureHeuristicAgent",
-                            action_type="llm_reasoning",
-                            target=f"{pkg.package_name} Code Audit",
-                            thought=(
-                                f"Detected architecture friction in {pkg.package_name}: {pkg.arch_sensitivity.simd_instruction_count} SIMD instruction(s), "
-                                f"complexity tier '{pkg.arch_sensitivity.simd_porting_complexity.value}'. Scaled engineering effort: {pkg.arch_complexity_effort_pd} PD."
-                            ),
-                            detail=pkg.arch_sensitivity.remediation_strategy
-                        ).model_dump()
-                    }
-                    await asyncio.sleep(0.2)
-                    step_counter += 1
-        else:
-            # Express triage: apply standard build sizing
-            for pkg in triaged_packages:
-                BuildAnalyzer.analyze_package_build(pkg, effective_os)
-
-        # Apply partial deliverable match multiplier to every package with effort > 0
-        for pkg in triaged_packages:
+    @classmethod
+    def _apply_effort_adjustments(
+        cls,
+        packages: List[PackageTriageResult],
+        arch_scan: Optional[ArchSupportScan],
+        docker_findings: List[DockerfileImageFinding],
+        config_findings: List[ConfigImageFinding],
+    ) -> None:
+        """Applies deliverable-match multipliers, repo-scan factor, and container-image effort in place."""
+        for pkg in packages:
             dm = pkg.deliverable_match
             if dm in (DeliverableMatchStatus.PARTIAL_DIFFERENT_TYPE, DeliverableMatchStatus.PARTIAL_DIFFERENT_VERSION):
-                from .models import _PARTIAL_EFFORT_MULTIPLIERS
                 mult = _PARTIAL_EFFORT_MULTIPLIERS[dm]
                 if pkg.total_effort_pd > 0:
-                    pkg.total_effort_pd = max(1, int(round(pkg.total_effort_pd * mult)))
+                    pkg.total_effort_pd = max(1, round_half_up(pkg.total_effort_pd * mult))
                 elif pkg.status in (AvailabilityStatus.NATIVE_AVAILABLE, AvailabilityStatus.PLATFORM_AGNOSTIC):
-                    # Partial match on a previously "zero effort" package — add integration overhead
+                    # Partial match on a previously zero-effort package: add integration overhead
                     pkg.total_effort_pd = 1 if dm == DeliverableMatchStatus.PARTIAL_DIFFERENT_VERSION else 2
 
-        # Apply Sub-Task 6 architecture support scan factor to unported components
         if arch_scan and arch_scan.effort_adjustment_factor != 1.0:
-            for p in triaged_packages:
+            for p in packages:
                 if p.arch_complexity_effort_pd > 0:
                     p.arch_complexity_effort_pd = round(p.arch_complexity_effort_pd * arch_scan.effort_adjustment_factor, 2)
-                total = (
-                    p.base_build_effort_pd
-                    + p.transitive_deps_effort_pd
-                    + p.arch_complexity_effort_pd
-                    + p.test_effort_pd
-                )
+                total = cls._component_effort(p)
                 if total > 0:
-                    p.total_effort_pd = max(1, int(round(total)))
+                    p.total_effort_pd = max(1, round_half_up(total))
 
-        # Add Sub-Task 5 & 7 container image effort into primary package
         container_extra_pd = sum(f.effort_pd for f in docker_findings) + sum(f.effort_pd for f in config_findings)
-        if container_extra_pd > 0 and triaged_packages:
-            triaged_packages[0].total_effort_pd += int(round(container_extra_pd))
+        if container_extra_pd > 0 and packages:
+            packages[0].total_effort_pd += round_half_up(container_extra_pd)
 
-        # Step 4: Aggregate Metrics & Scoring
-        total_count = len(triaged_packages)
-        native_count = sum(1 for p in triaged_packages if p.status == AvailabilityStatus.NATIVE_AVAILABLE)
-        agnostic_count = sum(1 for p in triaged_packages if p.status == AvailabilityStatus.PLATFORM_AGNOSTIC)
-        substitute_count = sum(1 for p in triaged_packages if p.status == AvailabilityStatus.SUBSTITUTE_AVAILABLE)
-        unported_count = sum(1 for p in triaged_packages if p.status == AvailabilityStatus.UNPORTED_BUILD_REQUIRED)
-        blocker_count = sum(1 for p in triaged_packages if p.status == AvailabilityStatus.BLOCKER)
+    @staticmethod
+    def _summarize(packages: List[PackageTriageResult], deliverable_type: DeliverableType) -> TriageSummary:
+        """Aggregates readiness, Fibonacci-sized effort and the qualification tier."""
+        total_count = len(packages)
+
+        def count(status: AvailabilityStatus) -> int:
+            return sum(1 for p in packages if p.status == status)
+
+        native_count = count(AvailabilityStatus.NATIVE_AVAILABLE)
+        agnostic_count = count(AvailabilityStatus.PLATFORM_AGNOSTIC)
+        substitute_count = count(AvailabilityStatus.SUBSTITUTE_AVAILABLE)
+        unported_count = count(AvailabilityStatus.UNPORTED_BUILD_REQUIRED)
+        blocker_count = count(AvailabilityStatus.BLOCKER)
         partial_count = sum(
-            1 for p in triaged_packages
+            1 for p in packages
             if p.deliverable_match in (
                 DeliverableMatchStatus.PARTIAL_DIFFERENT_TYPE,
                 DeliverableMatchStatus.PARTIAL_DIFFERENT_VERSION,
             )
         )
+        unported_transitive_count = sum(
+            1 for p in packages for d in p.build_dependencies
+            if d.status == AvailabilityStatus.UNPORTED_BUILD_REQUIRED
+        )
+        unported_test_count = sum(
+            1 for p in packages for td in p.test_dependencies
+            if td.status != AvailabilityStatus.NATIVE_AVAILABLE
+        )
 
-        # Count unported build-time transitive dependencies
-        unported_transitive_count = 0
-        for p in triaged_packages:
-            unported_transitive_count += sum(1 for d in p.build_dependencies if d.status == AvailabilityStatus.UNPORTED_BUILD_REQUIRED)
-
-        # Count unported test dependencies (Sub-Task 4)
-        unported_test_count = 0
-        for p in triaged_packages:
-            unported_test_count += sum(1 for td in p.test_dependencies if td.status != AvailabilityStatus.NATIVE_AVAILABLE)
-
-        # Readiness Score % — partial matches reduce score proportionally
         ready_units = (
             native_count + agnostic_count
             + (substitute_count * 0.9)
@@ -662,26 +407,18 @@ class TriageAgent:
         )
         readiness_pct = round((max(ready_units, 0) / max(total_count, 1)) * 100.0, 1)
 
-        # Effort Summation with Fibonacci single-value sizing (based on max effort)
-        BUFFER_PERSON_DAYS = 5  # 1 Person-Week buffer
-        raw_total_pd = sum(p.total_effort_pd for p in triaged_packages)
-
+        raw_total_pd = sum(p.total_effort_pd for p in packages)
         if raw_total_pd == 0 and unported_count == 0:
-            base_max_pd = 0
             fib_pd = 0
         elif raw_total_pd == 0:
-            base_max_pd = BUFFER_PERSON_DAYS
-            fib_pd = next_fibonacci_effort(base_max_pd)
+            fib_pd = next_fibonacci_effort(BUFFER_PERSON_DAYS)
         else:
-            buffered_total = raw_total_pd + BUFFER_PERSON_DAYS
-            base_max_pd = int(round(buffered_total * 1.30))
-            fib_pd = next_fibonacci_effort(base_max_pd)
+            fib_pd = next_fibonacci_effort(round_half_up((raw_total_pd + BUFFER_PERSON_DAYS) * EFFORT_CEILING_FACTOR))
 
-        # Positive Effort-Oriented Qualification Recommendations
         if blocker_count > 0:
             rec = SalesRecommendationTier.NOT_POSSIBLE_AS_IS
             rec_reason = f"Workload contains {blocker_count} proprietary x86 component(s) requiring architectural substitution (e.g. OpenBLAS / ESSL alternatives recommended)."
-        elif readiness_pct >= 90 and raw_total_pd == 0 and blocker_count == 0:
+        elif readiness_pct >= 90 and raw_total_pd == 0:
             rec = SalesRecommendationTier.MINIMAL_EFFORT
             rec_reason = f"Turnkey readiness ({readiness_pct}%). All components run out-of-the-box on IBM Power (0 Person-Days)."
         elif partial_count > 0 and readiness_pct >= 70:
@@ -700,7 +437,7 @@ class TriageAgent:
             rec = SalesRecommendationTier.SIGNIFICANT_EFFORT
             rec_reason = f"Extensive porting investment ({readiness_pct}% ready). Multi-tier transitive dependencies or vector kernels estimated at {fib_pd} Person-Days (Fibonacci max estimate)."
 
-        summary = TriageSummary(
+        return TriageSummary(
             total_packages=total_count,
             native_count=native_count,
             agnostic_count=agnostic_count,
@@ -718,45 +455,270 @@ class TriageAgent:
             partial_support_count=partial_count,
         )
 
-        # Step 5: Final Executive Synthesis
-        yield {
-            "type": "step",
-            "step": AgentStep(
-                step_id=step_counter,
-                agent_name="ExecutiveSynthesizer",
-                action_type="synthesis",
-                target="Executive Deliverables",
-                thought=f"Synthesizing pre-sales qualification brief and engineering backlog. Recommendation: {rec.value}.",
-            ).model_dump()
-        }
-        await asyncio.sleep(0.3)
-
-        # Attach repository and documentation links to triaged packages
-        for p in triaged_packages:
-            p_name_lower = p.package_name.lower()
-            if p_name_lower in KNOWN_ECOSYSTEM_DETAILS:
-                k = KNOWN_ECOSYSTEM_DETAILS[p_name_lower]
+    @staticmethod
+    def _attach_links(
+        packages: List[PackageTriageResult],
+        primary_pkg_name: Optional[str],
+        git_url: Optional[str],
+        doc_url: Optional[str],
+    ) -> None:
+        for p in packages:
+            name = p.package_name.lower()
+            if name in KNOWN_ECOSYSTEM_DETAILS:
+                k = KNOWN_ECOSYSTEM_DETAILS[name]
                 p.git_repo_url = k.get("git_repo_url")
                 p.doc_url = k.get("doc_url")
                 if not p.evidence_url:
                     p.evidence_url = p.git_repo_url or p.doc_url
-            elif p_name_lower == (primary_pkg_name or "").lower():
-                p.git_repo_url = detected_git_url
-                p.doc_url = detected_doc_url
+            elif name == (primary_pkg_name or "").lower():
+                p.git_repo_url = git_url
+                p.doc_url = doc_url
                 if not p.evidence_url:
-                    p.evidence_url = detected_git_url or detected_doc_url
+                    p.evidence_url = git_url or doc_url
 
-        # Generate Executive Brief Markdown
-        brief_md = self._generate_executive_brief(
+    # ------------------------------------------------------------------
+    # Orchestrator
+    # ------------------------------------------------------------------
+
+    async def run_triage_stream(self, request: TriageRequest) -> AsyncGenerator[Dict[str, Any], None]:
+        """Runs the triage pipeline yielding live agent steps and the final comprehensive response."""
+        if request.gemini_api_key and not self.gemini_client:
+            try:
+                from google import genai
+                self.gemini_client = genai.Client(api_key=request.gemini_api_key.strip())
+                self.prober.set_gemini_client(self.gemini_client)
+            except Exception as e:
+                logger.warning(f"Could not initialize requested Gemini client: {e}")
+
+        steps = self._Steps()
+        effective_os = request.effective_os()
+        deliverable_type: DeliverableType = request.deliverable_type
+
+        # Step 1: Ingestion & normalization
+        yield steps.emit(
+            "IngestionAgent", "plan", "Input Manifests",
+            "Ingesting provided input and normalizing it into a list of components (name, version, ecosystem).",
+            f"Target: {request.target_environment.display} (ppc64le). "
+            f"Deliverable: {deliverable_type.value.replace('_', ' ').title()}. "
+            f"Depth: {request.triage_depth.value}.",
+        )
+        await asyncio.sleep(0.3)
+
+        raw_text = request.raw_manifest or ""
+        parsed_items = UniversalNormalizer.normalize(raw_text, request.manifest_type or "auto")
+        detected_git_url, detected_doc_url = self._detect_urls(request, raw_text)
+        primary_pkg_name: Optional[str] = None
+        primary_version: Optional[str] = None
+        primary_ecosystem: Optional[str] = None
+
+        # Step 1.1: URL-based dependency inference
+        candidate_url = detected_git_url or detected_doc_url
+        if not candidate_url and raw_text and URLExtractor.is_url(raw_text):
+            candidate_url = raw_text.strip()
+            if "github.com" in candidate_url:
+                detected_git_url = candidate_url
+            else:
+                detected_doc_url = candidate_url
+
+        if candidate_url and URLExtractor.is_url(candidate_url):
+            yield steps.emit(
+                "URLScraperAgent", "url_inference", candidate_url,
+                f"Crawling package website or repository ({candidate_url}) to extract dependencies and manifest declarations...",
+            )
+            await asyncio.sleep(0.3)
+
+            url_pkgs, url_title, _url_note = await URLExtractor.extract_from_url(candidate_url, gemini_client=self.gemini_client)
+            if url_pkgs:
+                parsed_items.extend(url_pkgs)
+                primary_pkg_name = url_pkgs[0]["name"]
+                primary_version = url_pkgs[0].get("version", "latest")
+                primary_ecosystem = url_pkgs[0].get("ecosystem", "native_c")
+                yield steps.emit(
+                    "LLMDependencyInferenceAgent", "url_inference", url_title,
+                    f"Inferred {len(url_pkgs)} library requirements and version specifications from {candidate_url}.",
+                    ", ".join(f"{p['name']} ({p.get('version', 'latest')})" for p in url_pkgs[:6]) + ("..." if len(url_pkgs) > 6 else ""),
+                )
+                await asyncio.sleep(0.3)
+
+        for p in request.packages_list or []:
+            parsed_items.append({
+                "name": p.get("name", ""),
+                "version": p.get("version", "latest"),
+                "ecosystem": p.get("ecosystem", "container"),
+            })
+
+        unique_items = self._dedupe_items(parsed_items)
+        primary_pkg_name, primary_version, primary_ecosystem, detected_git_url, detected_doc_url = self._infer_primary(
+            unique_items, detected_git_url, detected_doc_url, primary_pkg_name, primary_version, primary_ecosystem
+        )
+
+        yield steps.emit(
+            "IngestionAgent", "plan", "Dependency Normalizer",
+            f"Successfully extracted and normalized {len(unique_items)} unique components across container, language, and system layers."
+            + (f" Primary package: {primary_pkg_name}." if primary_pkg_name else ""),
+            ", ".join(i["name"] for i in unique_items[:6]) + ("..." if len(unique_items) > 6 else ""),
+        )
+        await asyncio.sleep(0.3)
+
+        # Step 1.5: Repository architecture & container scan
+        arch_scan: Optional[ArchSupportScan] = None
+        docker_findings: List[DockerfileImageFinding] = []
+        config_findings: List[ConfigImageFinding] = []
+
+        scan_repo_url = detected_git_url or request.git_repo_url
+        if scan_repo_url:
+            yield steps.emit(
+                "RepoScanAgent", "scan", scan_repo_url,
+                "Cloning repository shallowly to inspect architecture markers, Dockerfiles, and CI configurations...",
+            )
+            await asyncio.sleep(0.2)
+            arch_scan, docker_findings, config_findings = await asyncio.to_thread(self._clone_and_scan, scan_repo_url)
+
+        if not arch_scan:
+            target_pkg_name = request.project_name or (unique_items[0]["name"] if unique_items else "workload")
+            arch_scan = RepoScanner.llm_infer_arch_support(target_pkg_name, gemini_client=self.gemini_client)
+
+        # Step 2: Multi-source availability probing
+        triaged_packages: List[PackageTriageResult] = []
+        unported_candidates: List[PackageTriageResult] = []
+
+        for item in unique_items:
+            name = item["name"]
+            version = item.get("version", "latest")
+            eco = item.get("ecosystem", "container")
+
+            yield steps.emit(
+                "AvailabilityProber", "lookup", f"{name} ({eco})",
+                f"Consulting live registries (Quay.io/Docker Hub/PyPI), {effective_os} repos, and Gemini LLM for {name} ({version}) on ppc64le...",
+            )
+            await asyncio.sleep(0.15)
+
+            probe_res = await self.prober.probe_component(name, version, eco, effective_os, deliverable_type)
+            pkg_result = PackageTriageResult(
+                package_name=name,
+                requested_version=version,
+                ecosystem=eco,
+                status=probe_res["status"],
+                tier_description=probe_res["tier"],
+                evidence_source=probe_res.get("evidence"),
+                evidence_url=probe_res.get("url"),
+                substitute_package=probe_res.get("substitute"),
+                version_warning=probe_res.get("version_warning"),
+                deliverable_match=probe_res.get("deliverable_match", DeliverableMatchStatus.SUPPORTED),
+                deliverable_detail=probe_res.get("deliverable_detail"),
+            )
+
+            if pkg_result.version_warning:
+                yield steps.emit(
+                    "AvailabilityProber", "lookup", f"{name} Version Notice",
+                    f"⚠️ {pkg_result.version_warning}",
+                    f"Requested: {version} | Verified Available on Power: {probe_res.get('available_version', 'N/A')}",
+                )
+                await asyncio.sleep(0.1)
+
+            if pkg_result.deliverable_detail and pkg_result.deliverable_match != DeliverableMatchStatus.SUPPORTED:
+                yield steps.emit(
+                    "DeliverableClassifier", "lookup", f"{name} Deliverable Match",
+                    f"Deliverable match [{deliverable_type.value}]: {pkg_result.deliverable_match.value.replace('_', ' ').title()}",
+                    pkg_result.deliverable_detail,
+                )
+                await asyncio.sleep(0.1)
+            elif probe_res.get("evidence"):
+                yield steps.emit(
+                    "AvailabilityProber", "lookup", f"{name} Verified",
+                    f"Qualification Result: {pkg_result.status.value.upper()} • {pkg_result.tier_description}",
+                    probe_res.get("evidence"),
+                )
+                await asyncio.sleep(0.1)
+
+            if pkg_result.status == AvailabilityStatus.UNPORTED_BUILD_REQUIRED:
+                unported_candidates.append(pkg_result)
+            triaged_packages.append(pkg_result)
+
+        await self._probe_image_findings(docker_findings, config_findings, effective_os, deliverable_type)
+
+        if triaged_packages:
+            triaged_packages[0].arch_support_scan = arch_scan
+            triaged_packages[0].dockerfile_image_findings = docker_findings
+            triaged_packages[0].config_image_findings = config_findings
+
+        # Step 3: Deep source build & transitive dependency scoping
+        if unported_candidates and request.triage_depth == "deep":
+            yield steps.emit(
+                "BuildScopingAgent", "deep_scan", "Unported Components",
+                f"Detected {len(unported_candidates)} unported components. Initiating deep source build audit, inspecting build-time dependencies, SIMD instructions, and test harnesses...",
+            )
+            await asyncio.sleep(0.3)
+
+            for pkg in unported_candidates:
+                yield steps.emit(
+                    "BuildScopingAgent", "deep_scan", pkg.package_name,
+                    f"Parsing build configuration for {pkg.package_name}. Auditing BuildRequires, SIMD instructions, and test dependencies...",
+                )
+                await asyncio.sleep(0.25)
+
+                BuildAnalyzer.analyze_package_build(pkg, effective_os)
+
+                unported_sub_deps = [d for d in pkg.build_dependencies if d.status == AvailabilityStatus.UNPORTED_BUILD_REQUIRED]
+                if unported_sub_deps:
+                    yield steps.emit(
+                        "BuildScopingAgent", "deep_scan", f"{pkg.package_name} Build-Tree",
+                        f"⚠️ Uncovered transitive dependency iceberg in {pkg.package_name}: {len(unported_sub_deps)} build requirement(s) also unported on ppc64le!",
+                        ", ".join(f"{d.name} (+{d.porting_effort_pd} PD)" for d in unported_sub_deps),
+                    )
+                    await asyncio.sleep(0.2)
+
+                if pkg.test_dependencies:
+                    yield steps.emit(
+                        "BuildScopingAgent", "deep_scan", f"{pkg.package_name} Test Validation",
+                        f"Scoped {len(pkg.test_dependencies)} test dependency/harness requirement(s). Test effort: {pkg.test_effort_pd} PD.",
+                        ", ".join(f"{t.name} ({t.status.value})" for t in pkg.test_dependencies),
+                    )
+                    await asyncio.sleep(0.15)
+
+                arch = pkg.arch_sensitivity
+                if arch and (arch.has_simd_avx or arch.has_64k_page_risk or arch.has_inline_asm):
+                    await self._refine_arch_with_llm(pkg)
+                    yield steps.emit(
+                        "ArchitectureHeuristicAgent", "llm_reasoning", f"{pkg.package_name} Code Audit",
+                        f"Detected architecture friction in {pkg.package_name}: {arch.simd_instruction_count} SIMD instruction(s), "
+                        f"complexity tier '{arch.simd_porting_complexity.value}'. Scaled engineering effort: {pkg.arch_complexity_effort_pd} PD.",
+                        arch.remediation_strategy,
+                    )
+                    await asyncio.sleep(0.2)
+
+            # Size the remaining components (blockers, substitutes, native) so their effort
+            # is not silently dropped from the total when other packages are unported.
+            for pkg in triaged_packages:
+                if pkg.status != AvailabilityStatus.UNPORTED_BUILD_REQUIRED:
+                    BuildAnalyzer.analyze_package_build(pkg, effective_os)
+        else:
+            for pkg in triaged_packages:
+                BuildAnalyzer.analyze_package_build(pkg, effective_os)
+
+        # Step 4: Aggregate metrics & scoring
+        self._apply_effort_adjustments(triaged_packages, arch_scan, docker_findings, config_findings)
+        summary = self._summarize(triaged_packages, deliverable_type)
+
+        # Step 5: Final executive synthesis
+        yield steps.emit(
+            "ExecutiveSynthesizer", "synthesis", "Executive Deliverables",
+            f"Synthesizing pre-sales qualification brief and engineering backlog. Recommendation: {summary.recommendation.value}.",
+        )
+        await asyncio.sleep(0.3)
+
+        self._attach_links(triaged_packages, primary_pkg_name, detected_git_url, detected_doc_url)
+
+        brief_md = await asyncio.to_thread(
+            self._generate_executive_brief,
             request, summary, triaged_packages, arch_scan, docker_findings, config_findings,
             primary_package_name=primary_pkg_name,
             git_repo_url=detected_git_url,
             doc_url=detected_doc_url,
             package_version=primary_version,
-            package_ecosystem=primary_ecosystem
+            package_ecosystem=primary_ecosystem,
         )
         csv_data = self._generate_csv(triaged_packages)
-
         detected_source_url = detected_git_url or detected_doc_url or (raw_text if URLExtractor.is_url(raw_text) else None)
 
         response = TriageResponse(
@@ -778,10 +740,7 @@ class TriageAgent:
             package_version=primary_version,
         )
 
-        yield {
-            "type": "result",
-            "data": response.model_dump()
-        }
+        yield {"type": "result", "data": response.model_dump()}
 
     def _generate_executive_brief(
         self,
@@ -823,8 +782,8 @@ class TriageAgent:
 **Primary Target Component:** `{primary_package_name or 'Multi-Component Stack'}` (Version: `{package_version or 'latest'}`)  
 **GitHub Repository:** [{git_repo_url or 'Not specified'}]({git_repo_url or '#'})  
 **Documentation Link:** [{doc_url or 'Not specified'}]({doc_url or '#'})  
-**Assessment Date:** 2026-09-09  
-**Triage Confidence:** High (Deterministic Probing + Deep Transitive Dependency Audit + SIMD Instruction Scaling)
+**Assessment Date:** {datetime.date.today().isoformat()}
+**Triage Basis:** Registry probing, curated knowledge base, and dependency/SIMD heuristics (see evidence per component)
 
 ---
 
@@ -958,10 +917,18 @@ class TriageAgent:
         return md
 
     def _generate_csv(self, packages: List[PackageTriageResult]) -> str:
+        def q(value) -> str:
+            return '"' + str(value if value is not None else "").replace('"', '""') + '"'
+
         lines = ["Package Name,Version,Ecosystem,Status,Tier,Effort (PD),Build System,Transitive Deps,Evidence Source"]
         for p in packages:
             num_deps = len(p.build_dependencies)
             build_sys = p.build_system or "N/A"
             evidence = p.evidence_source or ""
-            lines.append(f'"{p.package_name}","{p.requested_version}","{p.ecosystem}","{p.status.value}","{p.tier_description}",{p.total_effort_pd},"{build_sys}",{num_deps},"{evidence}"')
+            lines.append(
+                ",".join([
+                    q(p.package_name), q(p.requested_version), q(p.ecosystem), q(p.status.value),
+                    q(p.tier_description), str(p.total_effort_pd), q(build_sys), str(num_deps), q(evidence),
+                ])
+            )
         return "\n".join(lines)

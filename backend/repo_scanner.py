@@ -1,6 +1,7 @@
 import os
 import re
 import shutil
+import subprocess
 import tempfile
 import logging
 from typing import Dict, Any, List, Optional, Tuple
@@ -55,22 +56,34 @@ class RepoScanner:
     - Compose, Kubernetes, and CI workflow YAMLs referencing container images (Sub-Task 7)
     """
 
+    # Only plain https GitHub-style URLs are accepted; no whitespace, quotes or shell metacharacters.
+    _SAFE_GIT_URL_RE = re.compile(r"^https://[A-Za-z0-9.-]+/[A-Za-z0-9_.~/-]+$")
+    CLONE_TIMEOUT_SECONDS = 60
+
     @classmethod
     def shallow_clone_repo(cls, git_url: str, depth: int = 1) -> Optional[str]:
-        """Performs a temporary shallow git clone. Returns temporary directory path or None."""
-        if not git_url or not (git_url.startswith("http://") or git_url.startswith("https://") or git_url.startswith("git@")):
+        """Performs a temporary shallow git clone. Returns temporary directory path or None.
+
+        The URL is validated and passed as an argv element (no shell), with a timeout.
+        """
+        if not git_url or not cls._SAFE_GIT_URL_RE.match(git_url) or git_url.startswith("-"):
+            logger.warning("Rejected unsafe or unsupported git URL for cloning.")
             return None
 
         temp_dir = tempfile.mkdtemp(prefix="ppc_triage_repo_")
-        cmd = f"git clone --depth {depth} {git_url} {temp_dir}"
         logger.info(f"Cloning repository shallowly: {git_url}")
         try:
-            ret = os.system(f"{cmd} > /dev/null 2>&1")
+            ret = subprocess.run(
+                ["git", "clone", "--depth", str(int(depth)), "--", git_url, temp_dir],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=cls.CLONE_TIMEOUT_SECONDS,
+                env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+            ).returncode
             if ret == 0:
                 return temp_dir
-            else:
-                shutil.rmtree(temp_dir, ignore_errors=True)
-                return None
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            return None
         except Exception as e:
             logger.warning(f"Git clone failed for {git_url}: {e}")
             shutil.rmtree(temp_dir, ignore_errors=True)
@@ -188,7 +201,7 @@ class RepoScanner:
                     x86_only_markers_found=data.get("x86_only_markers", []),
                     ci_matrix_has_power=bool(data.get("ci_matrix_has_power", False)),
                     scan_source="llm_inference",
-                    effort_adjustment_factor=float(data.get("effort_adjustment_factor", 1.0))
+                    effort_adjustment_factor=min(max(float(data.get("effort_adjustment_factor", 1.0)), 0.5), 2.0)
                 )
         except Exception as e:
             logger.warning(f"LLM arch support inference failed for {package_name}: {e}")

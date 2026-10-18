@@ -1,4 +1,5 @@
 import logging
+import math
 from typing import Dict, Any, List, Optional, Tuple
 from .models import (
     AvailabilityStatus,
@@ -11,6 +12,9 @@ from .models import (
 )
 
 logger = logging.getLogger("build_analyzer")
+
+# Flat placeholder (person-days) for unported packages without curated build metadata.
+BASELINE_UNVERIFIED_BUILD_PD = 1.0
 
 
 def get_simd_multipliers(count: int, complexity: SIMDPortingComplexity) -> Tuple[float, float]:
@@ -230,7 +234,7 @@ class BuildAnalyzer:
                 + package.arch_complexity_effort_pd
                 + package.test_effort_pd
             )
-            package.total_effort_pd = int(round(total_effort))
+            package.total_effort_pd = int(math.floor(total_effort + 0.5))
             unported_build_cnt = sum(1 for d in build_deps if d.status != AvailabilityStatus.NATIVE_AVAILABLE)
             unported_test_cnt = sum(1 for t in test_deps if t.status != AvailabilityStatus.NATIVE_AVAILABLE)
             package.porting_notes = (
@@ -244,131 +248,31 @@ class BuildAnalyzer:
 
     @classmethod
     def _dynamic_heuristic_build(cls, package: PackageTriageResult, target_os: str) -> PackageTriageResult:
-        pkg_name = package.package_name.lower()
-        
-        # Detect if it's specifically a custom vector/DSP math acceleration component
-        is_custom_vector = any(ext in pkg_name for ext in ["dsp", "simd", "avx", "vector", "matrix"])
-        
-        if is_custom_vector:
-            package.build_system = "CMake / Ninja"
-            package.toolchain_prerequisites = [
-                ToolchainRequirement(tool="GCC / G++", required_version=">= 11.0", ppc64le_supported=True, notes=f"Native compiler in {target_os}"),
-                ToolchainRequirement(tool="CMake", required_version=">= 3.20", ppc64le_supported=True, notes="Standard build tool")
-            ]
-            
-            # Sub-dependency for custom vector/DSP acceleration
-            unported_sub_dep = BuildDependency(
-                name=f"{pkg_name}-vector-submodule",
-                version="1.0",
-                purpose="Internal SIMD Vector Kernel",
-                status=AvailabilityStatus.UNPORTED_BUILD_REQUIRED,
-                porting_effort_pd=1.5,
-                evidence_source="Custom internal C/C++ SIMD vector extension",
-                notes="Contains x86 AVX2 intrinsics. Can be ported using SIMDe (simde/x86/avx2.h) or Power VSX intrinsics."
-            )
-            
-            common_os_dep = BuildDependency(
-                name="glibc-devel",
-                version="2.34",
-                purpose="Standard C Runtime Header",
-                status=AvailabilityStatus.NATIVE_AVAILABLE,
-                porting_effort_pd=0.0,
-                evidence_source=f"Available in {target_os} ppc64le BaseOS"
-            )
+        """Baseline estimate for unported components with no curated build metadata.
 
-            package.build_dependencies = [common_os_dep, unported_sub_dep]
-            package.arch_sensitivity = ArchSensitivity(
-                has_simd_avx=True,
-                simd_details="Source code references x86 SIMD vector intrinsics (immintrin.h / AVX2)",
-                simd_instruction_count=85,
-                simd_porting_complexity=SIMDPortingComplexity.SIMDE_COMPATIBLE,
-                has_inline_asm=False,
-                has_64k_page_risk=False,
-                remediation_strategy="Include 'simde/x86/avx2.h' header to map AVX2 calls to Power VSX instructions without extensive rewrite.",
-                code_snippet="// Detected in vector source:\n#include <immintrin.h>\n__m256d vA = _mm256_load_pd(&data[i]);\n__m256d vB = _mm256_mul_pd(vA, vWeight);"
-            )
-            
-            package.test_dependencies = [
-                TestDependency(
-                    name="gtest",
-                    version="1.11",
-                    test_dep_type="framework",
-                    status=AvailabilityStatus.NATIVE_AVAILABLE,
-                    evidence_source=f"Available in {target_os} EPEL ppc64le",
-                    porting_effort_pd=0.0
-                ),
-                TestDependency(
-                    name="vector-accuracy-test-harness",
-                    version="1.0",
-                    test_dep_type="unit_test",
-                    status=AvailabilityStatus.UNPORTED_BUILD_REQUIRED,
-                    evidence_source="x86 floating-point precision regression suite",
-                    porting_effort_pd=0.5,
-                    notes="Requires cross-validating VSX double precision results against x86 FMA output"
-                )
-            ]
-            package.test_effort_pd = 0.5
-
-            package.base_build_effort_pd = 1.0
-            package.transitive_deps_effort_pd = unported_sub_dep.porting_effort_pd
-            base_arch = 2.0
-            package.base_arch_complexity_effort_pd = base_arch
-            count_m, comp_m = get_simd_multipliers(
-                package.arch_sensitivity.simd_instruction_count,
-                package.arch_sensitivity.simd_porting_complexity
-            )
-            package.arch_sensitivity.base_engineering_effort_pd = base_arch
-            package.arch_sensitivity.simd_instruction_multiplier = count_m
-            package.arch_sensitivity.simd_complexity_multiplier = comp_m
-            package.arch_complexity_effort_pd = scale_arch_effort(
-                base_arch,
-                package.arch_sensitivity.simd_instruction_count,
-                package.arch_sensitivity.simd_porting_complexity
-            )
-            total = (
-                package.base_build_effort_pd
-                + package.transitive_deps_effort_pd
-                + package.arch_complexity_effort_pd
-                + package.test_effort_pd
-            )
-            package.total_effort_pd = int(round(total))
-            package.confidence_level = "Medium"
-            package.porting_notes = (
-                f"Custom vector/DSP library. Scoped 2 build-time dependencies, including 1 unported vector submodule "
-                f"({unported_sub_dep.porting_effort_pd} PD), AVX2 translation ({package.arch_complexity_effort_pd} PD), "
-                f"and test validation ({package.test_effort_pd} PD)."
-            )
-        else:
-            # Generic portable C/C++ package
-            package.build_system = "CMake / Autotools"
-            package.toolchain_prerequisites = [
-                ToolchainRequirement(tool="GCC / G++", required_version=">= 8.5", ppc64le_supported=True, notes="Standard C/C++ toolchain")
-            ]
-            package.build_dependencies = [
-                BuildDependency(name="glibc-devel", status=AvailabilityStatus.NATIVE_AVAILABLE, porting_effort_pd=0.0, evidence_source=f"Available in {target_os} ppc64le BaseOS")
-            ]
-            package.test_dependencies = [
-                TestDependency(
-                    name="ctest",
-                    version="3.20",
-                    test_dep_type="framework",
-                    status=AvailabilityStatus.NATIVE_AVAILABLE,
-                    evidence_source=f"Available in {target_os} BaseOS",
-                    porting_effort_pd=0.0
-                )
-            ]
-            package.test_effort_pd = 0.0
-            package.arch_sensitivity = ArchSensitivity(
-                has_simd_avx=False,
-                has_inline_asm=False,
-                has_64k_page_risk=False,
-                remediation_strategy="Recompile from clean source with standard gcc flags on ppc64le."
-            )
-            package.base_build_effort_pd = 0.5
-            package.transitive_deps_effort_pd = 0.0
-            package.arch_complexity_effort_pd = 0.0
-            package.total_effort_pd = 1  # 0.5 rounded to nearest integer
-            package.confidence_level = "Medium"
-            package.porting_notes = "Standard portable C/C++ codebase. Clean rebuild and test execution on target Power environment expected to succeed."
-
+        No build dependencies, SIMD counts, or test harnesses are invented here: nothing was
+        discovered about this package's source, so none are reported. The result is a flat,
+        clearly-labelled low-confidence placeholder that the report tells the user to confirm
+        with a source audit. SIMD/asm/page-size findings only appear when the curated
+        knowledge base, the repository scan, or the LLM audit actually produce them.
+        """
+        package.build_system = "Unknown (not discovered)"
+        package.toolchain_prerequisites = []
+        package.build_dependencies = []
+        package.test_dependencies = []
+        package.test_effort_pd = 0.0
+        package.arch_sensitivity = ArchSensitivity(
+            remediation_strategy="Not assessed: no source inspected. Run a source audit for x86 SIMD, inline assembly and 64KB page assumptions."
+        )
+        package.base_build_effort_pd = BASELINE_UNVERIFIED_BUILD_PD
+        package.transitive_deps_effort_pd = 0.0
+        package.base_arch_complexity_effort_pd = 0.0
+        package.arch_complexity_effort_pd = 0.0
+        package.total_effort_pd = max(1, int(math.floor(BASELINE_UNVERIFIED_BUILD_PD + 0.5)))
+        package.confidence_level = "Low"
+        package.porting_notes = (
+            f"No curated build metadata for '{package.package_name}' on {target_os} ppc64le. "
+            f"Applied a flat {BASELINE_UNVERIFIED_BUILD_PD} PD baseline for a source rebuild; transitive build "
+            "dependencies, architecture-sensitive code and tests were NOT assessed. Confirm with a source audit."
+        )
         return package

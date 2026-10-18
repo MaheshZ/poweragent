@@ -929,8 +929,12 @@ class MultiSourceProber:
             logger.debug(f"Docker Hub live probe error for {image_path}: {e}")
         return None
 
-    async def _probe_pypi(self, name: str, version: str) -> Dict[str, Any]:
-        """Live probe of PyPI JSON API checking for ppc64le wheels and universal wheels."""
+    async def _probe_pypi(self, name: str, version: str) -> Optional[Dict[str, Any]]:
+        """Live probe of PyPI JSON API checking for ppc64le wheels and universal wheels.
+
+        Returns None when the package cannot be resolved (404, network error) so callers
+        fall through to later probes instead of treating unknown names as ready.
+        """
         has_specific_ver = bool(version and version != "latest")
         url = f"https://pypi.org/pypi/{name}/{version}/json" if has_specific_ver else f"https://pypi.org/pypi/{name}/json"
         try:
@@ -987,12 +991,7 @@ class MultiSourceProber:
         except Exception as e:
             logger.debug(f"PyPI probe error for {name}: {e}")
 
-        return {
-            "status": AvailabilityStatus.PLATFORM_AGNOSTIC,
-            "tier": "Python Package (assumed pure script)",
-            "evidence": f"Standard PyPI package {name}",
-            "url": f"https://pypi.org/project/{name}"
-        }
+        return None
 
     async def _probe_gemini_llm(self, name: str, version: str, ecosystem: str, target_os: str) -> Optional[Dict[str, Any]]:
         """Invokes Gemini LLM to research and qualify component availability on IBM Power ppc64le."""

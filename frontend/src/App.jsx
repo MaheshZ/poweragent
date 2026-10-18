@@ -47,6 +47,7 @@ export default function App() {
     setAgentSteps([]);
     setTriageResult(null);
 
+    let streamError = null;
     try {
       const response = await fetch('/api/triage/stream', {
         method: 'POST',
@@ -80,12 +81,17 @@ export default function App() {
                 setAgentSteps(prev => [...prev, event.step]);
               } else if (event.type === 'result') {
                 setTriageResult(event.data);
+              } else if (event.type === 'error') {
+                streamError = event.message || 'Triage failed on the server.';
               }
             } catch (jsonErr) {
               console.error('Error parsing SSE event:', jsonErr);
             }
           }
         }
+      }
+      if (streamError) {
+        alert(streamError);
       }
     } catch (err) {
       console.warn('Streaming error, falling back to direct POST:', err);
